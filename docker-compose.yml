@@ -1,0 +1,84 @@
+version: "3.9"
+
+services:
+  # PostgreSQL 数据库
+  postgres:
+    image: postgres:16
+    container_name: uni-qa-postgres
+    environment:
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: cqjtu@yxjpgsql
+      POSTGRES_DB: mydb
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U myuser -d mydb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis 缓存
+  redis:
+    image: redis:7-alpine
+    container_name: uni-qa-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MinIO 对象存储
+  minio:
+    image: minio/minio:latest
+    container_name: uni-qa-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  # 后端 API
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: uni-qa-api
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://myuser:cqjtu@yxjpgsql@postgres:5432/mydb
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # 前端
+  web:
+    build:
+      context: ./web-client
+      dockerfile: Dockerfile
+    container_name: uni-qa-web
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+
+volumes:
+  pg_data:
+  redis_data:
+  minio_data:
