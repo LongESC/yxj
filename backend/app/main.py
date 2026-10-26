@@ -1,38 +1,32 @@
-"""高校智能问答助手 - FastAPI 主应用"""
+"""FastAPI 主应用 — 高校智能问答助手"""
 
-import json
-import time
-import uuid
+import hashlib
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
-from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi import FastAPI, Depends, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from langchain_core.messages import HumanMessage
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import get_settings
-from app.database import get_db, engine, Base
-from app.models import User
-from app.auth import get_current_user, create_access_token
-from app.services import (
-    authenticate_user, init_admin,
-    list_conversations, create_conversation, delete_conversation, update_conversation_title,
-    list_messages, save_message, create_feedback,
-    list_kbs, create_kb, get_kb,
-    log_audit,
+from app.agent import GRAPH_VERSION
+from app.application import chat_service
+from app.application.kb_service import create_document, list_documents
+from app.core.auth import create_access_token, get_current_user, require_role
+from app.core.config import get_settings
+from app.core.database import Base, engine, async_session_factory, get_db
+from app.core.logging import setup_logging
+from app.domain.models import (
+    AuditLog, Conversation, Document, Feedback, KnowledgeBase, Message, User,
 )
 from app.schemas import (
-    LoginRequest, LoginResponse, UserOut,
-    ConversationCreate, ConversationOut,
-    ChatRequest, MessageOut, CitationOut, ChatDoneData,
-    KBCreate, KBOut, DocumentOut,
-    FeedbackCreate, FeedbackOut,
-    ApiResponse,
+    ApiResponse, ChatRequest, ConversationCreate, ConversationOut,
+    ConversationUpdate, DashboardOut, FeedbackCreate, FeedbackOut,
+    KBCreate, KBOut, DocumentOut, LoginRequest, LoginResponse,
+    MessageOut, UserOut,
 )
-from app.agent import agent_graph, GRAPH_VERSION
+from app.infrastructure.storage import upload_file
 
 settings = get_settings()
 
@@ -43,12 +37,13 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator:
-    """应用启动/关闭"""
+    setup_logging()
     # 启动：创建表 + 初始化管理员
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    async with get_db().__anext__() as db:
-        await init_admin(db, settings.ADMIN_USERNAME, settings.ADMIN_DEFAULT_PASSWORD)
+    async with async_session_factory() as db:
+        await chat_service.init_admin(db, settings.ADMIN_USERNAME, settings.ADMIN_DEFAULT_PASSWORD)
+        await db.commit()
     print(f"✅ 应用启动完成 | 环境: {settings.APP_ENV} | Agent图版本: {GRAPH_VERSION}")
     yield
     await engine.dispose()
@@ -74,8 +69,8 @@ app.add_middleware(
 # 健康检查
 # ============================================================
 
-@app.get("/healthz", tags=["系统"])
-async def health_check():
+@app.get("/health")
+async def health():
     return {"status": "ok", "graph_version": GRAPH_VERSION}
 
 
@@ -83,222 +78,89 @@ async def health_check():
 # 认证
 # ============================================================
 
-@app.post("/api/v1/auth/login", response_model=LoginResponse, tags=["认证"])
-async def login(data: LoginRequest, db: AsyncSession = Depends(get_db)):
-    """用户登录，返回 JWT token"""
-    user = await authenticate_user(db, data.username, data.password)
-    if not user:
+@app.post("/api/v1/auth/login", response_model=LoginResponse)
+async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
+    user = await chat_service.authenticate_user(db, body.username, body.password)
+    if user is None:
         raise HTTPException(status_code=401, detail="用户名或密码错误")
-    token = create_access_token(user.id, user.username, user.role)
-    await log_audit(db, "login", user_id=user.id)
+    role_code = user.role.code if user.role else "user"
+    token = create_access_token(user.id, user.username, role_code)
+    await chat_service.log_audit(db, user.id, "login")
+    await db.commit()
     return LoginResponse(
         access_token=token,
         user=UserOut.model_validate(user),
     )
 
 
-@app.get("/api/v1/auth/me", response_model=UserOut, tags=["认证"])
+@app.get("/api/v1/auth/me", response_model=UserOut)
 async def get_me(user: User = Depends(get_current_user)):
-    """获取当前用户信息"""
     return UserOut.model_validate(user)
 
 
 # ============================================================
-# 会话管理
+# 会话
 # ============================================================
 
-@app.get("/api/v1/conversations", response_model=list[ConversationOut], tags=["会话"])
-async def get_conversations(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    """获取当前用户的会话列表"""
-    return await list_conversations(db, user.id)
+@app.get("/api/v1/conversations", response_model=list[ConversationOut])
+async def list_convs(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    convs = await chat_service.list_conversations(db, user.id)
+    return [ConversationOut.model_validate(c) for c in convs]
 
 
-@app.post("/api/v1/conversations", response_model=ConversationOut, tags=["会话"])
-async def new_conversation(
-    data: ConversationCreate,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """创建新会话"""
-    conv = await create_conversation(db, user.id, data)
-    await log_audit(db, "conversation_create", user_id=user.id, object_id=str(conv.id))
-    return conv
+@app.post("/api/v1/conversations", response_model=ConversationOut)
+async def create_conv(body: ConversationCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    conv = await chat_service.create_conversation(db, user.id, body.title, body.kb_ids)
+    await db.commit()
+    return ConversationOut.model_validate(conv)
 
 
-@app.delete("/api/v1/conversations/{conv_id}", tags=["会话"])
-async def remove_conversation(
-    conv_id: int,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """删除会话"""
-    ok = await delete_conversation(db, user.id, conv_id)
-    if not ok:
-        raise HTTPException(status_code=404, detail="会话不存在")
-    return ApiResponse(message="删除成功")
+@app.delete("/api/v1/conversations/{conv_id}")
+async def delete_conv(conv_id: int, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    await chat_service.delete_conversation(db, conv_id, user.id)
+    await db.commit()
+    return {"message": "已删除"}
 
 
-@app.patch("/api/v1/conversations/{conv_id}", tags=["会话"])
-async def rename_conversation(
-    conv_id: int,
-    title: str = Query(..., min_length=1, max_length=100),
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """重命名会话"""
-    ok = await update_conversation_title(db, user.id, conv_id, title)
-    if not ok:
-        raise HTTPException(status_code=404, detail="会话不存在")
-    return ApiResponse(message="更新成功")
+@app.put("/api/v1/conversations/{conv_id}", response_model=ConversationOut)
+async def update_conv(conv_id: int, body: ConversationUpdate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    if body.title:
+        conv = await chat_service.update_conversation_title(db, conv_id, user.id, body.title)
+        await db.commit()
+        return ConversationOut.model_validate(conv)
+    raise HTTPException(status_code=400, detail="无更新内容")
 
 
 # ============================================================
-# 消息历史
+# 消息
 # ============================================================
 
-@app.get("/api/v1/conversations/{conv_id}/messages", response_model=list[MessageOut], tags=["消息"])
-async def get_messages(
-    conv_id: int,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """获取会话消息列表"""
-    return await list_messages(db, conv_id, user.id)
+@app.get("/api/v1/conversations/{conv_id}/messages", response_model=list[MessageOut])
+async def list_msgs(conv_id: int, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    msgs = await chat_service.list_messages(db, conv_id, user.id)
+    return [MessageOut.model_validate(m) for m in msgs]
 
 
 # ============================================================
 # 问答（SSE 流式）
 # ============================================================
 
-@app.post("/api/v1/chat/completions", tags=["问答"])
+@app.post("/api/v1/chat/completions")
 async def chat_completions(
-    data: ChatRequest,
+    body: ChatRequest,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    智能问答接口（SSE 流式输出）
-
-    事件类型：step / tool_call / tool_result / delta / citation / done / error
-    """
-    # 确定会话
-    conv_id = data.conversation_id
-    if not conv_id:
-        conv = await create_conversation(db, user.id, ConversationCreate(kb_ids=data.kb_ids))
+    # 如果没有 conversation_id，自动创建
+    conv_id = body.conversation_id
+    if conv_id is None:
+        conv = await chat_service.create_conversation(db, user.id, body.question[:50])
         conv_id = conv.id
-    else:
-        # 验证会话归属
-        from app.models import Conversation
-        result = await db.execute(
-            select(Conversation).where(Conversation.id == conv_id, Conversation.user_id == user.id)
-        )
-        if not result.scalar_one_or_none():
-            raise HTTPException(status_code=404, detail="会话不存在")
-
-    # 保存用户消息
-    user_msg = await save_message(db, conv_id, "user", data.question)
-    await db.commit()
-
-    # 构建 Agent 输入
-    kb_ids = data.kb_ids or []
-    initial_state = {
-        "messages": [HumanMessage(content=data.question)],
-        "user_id": user.id,
-        "kb_ids": kb_ids,
-        "rewritten_queries": [],
-        "retrieved_chunks": [],
-        "citations": [],
-        "iteration": 0,
-        "token_usage": {"prompt": 0, "completion": 0},
-        "answer_type": "normal",
-        "trace_id": "",
-    }
 
     async def event_stream():
-        start_time = time.time()
-        first_token_time = None
-        answer_parts = []
-        trace_id = ""
-        iteration = 0
-        answer_type = "normal"
-
-        try:
-            async for event in agent_graph.astream(initial_state, stream_mode="updates"):
-                for node_name, node_output in event.items():
-                    # 发送步骤事件
-                    if data.show_steps:
-                        step_labels = {
-                            "guard_in": "正在初始化…",
-                            "rewrite": "正在理解问题…",
-                            "agent": "正在思考…",
-                            "tools": "正在检索知识库…",
-                            "synthesize": "正在生成答案…",
-                        }
-                        yield f"event: step\ndata: {json.dumps({'node': node_name, 'label': step_labels.get(node_name, ''), 'ensure_ascii': False})}\n\n"
-
-                    # 处理工具调用
-                    if node_name == "agent" and "messages" in node_output:
-                        for msg in node_output["messages"]:
-                            if hasattr(msg, "tool_calls") and msg.tool_calls:
-                                for tc in msg.tool_calls:
-                                    yield f"event: tool_call\ndata: {json.dumps({'tool': tc['name'], 'args': tc['args']}, ensure_ascii=False)}\n\n"
-
-                    # 处理工具结果
-                    if node_name == "tools" and "messages" in node_output:
-                        for msg in node_output["messages"]:
-                            yield f"event: tool_result\ndata: {json.dumps({'tool': 'result', 'content': str(msg.content)[:200]}, ensure_ascii=False)}\n\n"
-
-                    # 处理最终答案
-                    if node_name == "synthesize" and "messages" in node_output:
-                        for msg in node_output["messages"]:
-                            content = msg.content if hasattr(msg, "content") else str(msg)
-                            if first_token_time is None:
-                                first_token_time = time.time()
-
-                            # 逐字发送
-                            for char in content:
-                                answer_parts.append(char)
-                                yield f"event: delta\ndata: {json.dumps({'text': char}, ensure_ascii=False)}\n\n"
-
-                    # 记录 trace_id 和迭代次数
-                    if "trace_id" in node_output and node_output["trace_id"]:
-                        trace_id = node_output["trace_id"]
-                    if "iteration" in node_output:
-                        iteration = node_output["iteration"]
-                    if "answer_type" in node_output:
-                        answer_type = node_output["answer_type"]
-
-            # 发送完成事件
-            total_latency = int((time.time() - start_time) * 1000)
-            first_token_ms = int((first_token_time - start_time) * 1000) if first_token_time else None
-
-            # 保存助手消息
-            answer_text = "".join(answer_parts)
-            await save_message(
-                db, conv_id, "assistant", answer_text,
-                model=settings.VOLCENGINE_MODEL,
-                iteration=iteration,
-                latency_ms=total_latency,
-                first_token_ms=first_token_ms,
-                answer_type=answer_type,
-                trace_id=trace_id,
-            )
-            await db.commit()
-
-            done_data = {
-                "message_id": user_msg.id + 1,  # 近似值
-                "answer_type": answer_type,
-                "iteration": iteration,
-                "latency_ms": total_latency,
-                "first_token_ms": first_token_ms,
-                "model": settings.VOLCENGINE_MODEL,
-                "graph_version": GRAPH_VERSION,
-                "trace_id": trace_id,
-            }
-            yield f"event: done\ndata: {json.dumps(done_data, ensure_ascii=False)}\n\n"
-
-        except Exception as e:
-            yield f"event: error\ndata: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+        async for event in chat_service.run_agent_stream(db, user, conv_id, body.question, body.kb_ids):
+            yield event
+        await db.commit()
 
     return StreamingResponse(
         event_stream(),
@@ -315,38 +177,89 @@ async def chat_completions(
 # 反馈
 # ============================================================
 
-@app.post("/api/v1/feedback", response_model=FeedbackOut, tags=["反馈"])
-async def submit_feedback(
-    data: FeedbackCreate,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """提交问答反馈（点赞/点踩）"""
-    return await create_feedback(db, user.id, data)
+@app.post("/api/v1/feedback", response_model=FeedbackOut)
+async def create_fb(body: FeedbackCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    fb = await chat_service.create_feedback(db, user.id, body.message_id, body.rating, body.reason_tags, body.comment)
+    await db.commit()
+    return FeedbackOut.model_validate(fb)
 
 
 # ============================================================
 # 知识库
 # ============================================================
 
-@app.get("/api/v1/knowledge-bases", response_model=list[KBOut], tags=["知识库"])
-async def get_knowledge_bases(db: AsyncSession = Depends(get_db)):
-    """获取知识库列表"""
-    return await list_kbs(db)
+@app.get("/api/v1/knowledge-bases", response_model=list[KBOut])
+async def list_kbs(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    kbs = await chat_service.list_kbs(db, user.id)
+    return [KBOut.model_validate(kb) for kb in kbs]
 
 
-@app.post("/api/v1/knowledge-bases", response_model=KBOut, tags=["知识库"])
-async def create_knowledge_base(
-    data: KBCreate,
-    user: User = Depends(get_current_user),
+@app.post("/api/v1/knowledge-bases", response_model=KBOut)
+async def create_kb_api(
+    body: KBCreate,
+    user: User = Depends(require_role("kb_admin", "sys_admin")),
     db: AsyncSession = Depends(get_db),
 ):
-    """创建知识库"""
-    if user.role not in ("kb_admin", "sys_admin"):
-        raise HTTPException(status_code=403, detail="权限不足")
-    kb = await create_kb(db, data)
-    await log_audit(db, "kb_create", user_id=user.id, object_id=str(kb.id))
-    return kb
+    kb = await chat_service.create_kb(db, body.name, body.code, body.owner_dept, body.description)
+    await db.commit()
+    return KBOut.model_validate(kb)
+
+
+@app.get("/api/v1/knowledge-bases/{kb_id}/documents", response_model=list[DocumentOut])
+async def list_docs(kb_id: int, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    docs = await list_documents(db, kb_id)
+    return [DocumentOut.model_validate(d) for d in docs]
+
+
+@app.post("/api/v1/knowledge-bases/{kb_id}/documents", response_model=DocumentOut)
+async def upload_doc(
+    kb_id: int,
+    file: UploadFile = File(...),
+    user: User = Depends(require_role("kb_admin", "sys_admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    file_bytes = await file.read()
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
+    file_key = await upload_file(file_bytes, file.filename or "unknown")
+
+    source_type = (file.filename or "").rsplit(".", 1)[-1].lower() if file.filename else "unknown"
+    doc = await create_document(db, kb_id, file.filename or "unknown", source_type, file_key, file_hash, user.id)
+    await db.commit()
+    return DocumentOut.model_validate(doc)
+
+
+# ============================================================
+# 管理后台
+# ============================================================
+
+@app.get("/api/v1/admin/dashboard", response_model=DashboardOut)
+async def dashboard(
+    user: User = Depends(require_role("sys_admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    total_users = (await db.execute(select(func.count(User.id)))).scalar() or 0
+    total_convs = (await db.execute(select(func.count(Conversation.id)))).scalar() or 0
+    total_msgs = (await db.execute(select(func.count(Message.id)))).scalar() or 0
+    total_docs = (await db.execute(select(func.count(Document.id)))).scalar() or 0
+    return DashboardOut(
+        total_users=total_users,
+        total_conversations=total_convs,
+        total_messages=total_msgs,
+        total_documents=total_docs,
+    )
+
+
+@app.get("/api/v1/admin/audit-logs")
+async def audit_logs(
+    limit: int = Query(50, ge=1, le=200),
+    user: User = Depends(require_role("sys_admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(AuditLog).order_by(AuditLog.created_at.desc()).limit(limit)
+    )
+    logs = result.scalars().all()
+    return [{"id": l.id, "user_id": l.user_id, "action": l.action, "object_type": l.object_type, "object_id": l.object_id, "client_ip": str(l.client_ip) if l.client_ip else None, "trace_id": l.trace_id, "created_at": l.created_at.isoformat()} for l in logs]
 
 
 # ============================================================

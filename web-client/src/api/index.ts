@@ -59,7 +59,7 @@ export function deleteConversation(id: number) {
 }
 
 export function renameConversation(id: number, title: string) {
-  return api.patch(`/conversations/${id}?title=${encodeURIComponent(title)}`)
+  return api.put(`/conversations/${id}`, { title })
 }
 
 // ============================================================
